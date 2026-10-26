@@ -1,0 +1,87 @@
+name: Controlled reusable tests
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: false
+        type: string
+      notify_slack:
+        required: false
+        type: boolean
+        default: false
+      test_tags:
+        required: false
+        type: string
+        default: ""
+      ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AIVEN_TOKEN:
+        required: true
+      AIVEN_ACCOUNT_ID:
+        required: true
+      AIVEN_PROJECT_NAME_PREFIX:
+        required: true
+
+jobs:
+  setup_aiven_project_suffix:
+    runs-on: ubuntu-latest
+    outputs:
+      project_name_suffix: ${{ steps.selproj.outputs.project_name_suffix }}
+    steps:
+      - id: selproj
+        run: echo "project_name_suffix=CONTROLLED_DUMMY" >> "$GITHUB_OUTPUT"
+
+  find_tests:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find_tests.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - id: find_tests
+        run: |
+          output=$(task find-test-tags TAGS="${{ inputs.test_tags }}")
+          echo "$output" >> $GITHUB_OUTPUT
+
+  validate_matrix:
+    needs: find_tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if matrix is empty
+        run: |
+          matrix='${{ needs.find_tests.outputs.matrix }}'
+          if [ "$matrix" = "[]" ]; then
+            echo "Error: No matching test tags found!"
+            exit 1
+          fi
+
+  test:
+    needs: [setup_aiven_project_suffix, find_tests, validate_matrix]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        name: ${{ fromJson(needs.find_tests.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+      - run: make test-tag tag=${{ matrix.name }}
+        env:
+          AIVEN_DEBUG: ${{ vars.AIVEN_DEBUG || 'false' }}
+          ENABLE_DEBUG_LOGGING: ${{ vars.ENABLE_DEBUG_LOGGING || 'false' }}
+          AIVEN_TOKEN: ${{ secrets.AIVEN_TOKEN }}
+          AIVEN_ACCOUNT_ID: ${{ secrets.AIVEN_ACCOUNT_ID }}
+          AIVEN_PROJECT_NAME: >-
+            ${{ secrets.AIVEN_PROJECT_NAME_PREFIX }}${{ needs.setup_aiven_project_suffix.outputs.project_name_suffix }}

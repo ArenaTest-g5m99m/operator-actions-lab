@@ -1,0 +1,94 @@
+name: Controlled PR Test Command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  check-command:
+    name: Check Test Command
+    runs-on: ubuntu-latest
+    if: |
+      github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/test') || startsWith(github.event.comment.body, '/test-all'))
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      pr_number: ${{ steps.pr.outputs.number }}
+      pr_sha: ${{ steps.pr.outputs.sha }}
+      test_tags: ${{ steps.parse_command.outputs.test_tags }}
+    steps:
+      - name: Check user permissions
+        id: check
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const association = context.payload.comment.author_association;
+            const allowedAssociations = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            const shouldRun = allowedAssociations.includes(association);
+
+            core.setOutput('should_run', shouldRun);
+            return shouldRun;
+
+      - name: Get PR details
+        id: pr
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+
+            const isFork = pr.data.head.repo?.full_name !== pr.data.base.repo.full_name;
+            if (isFork) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: 'Refusing controlled test on a fork PR'
+              });
+              core.setFailed('Refusing to run /test on a fork PR.');
+              return;
+            }
+
+            core.setOutput('number', pr.data.number);
+            core.setOutput('sha', pr.data.head.sha);
+
+      - name: Parse test command
+        id: parse_command
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const comment = context.payload.comment.body;
+            const lines = comment.split('\n');
+            const commandLine = lines[0].trim();
+            let testTags = '';
+
+            if (commandLine.startsWith('/test ')) {
+              testTags = commandLine.substring(6).trim();
+            }
+
+            core.setOutput('test_tags', testTags);
+
+  run-tests:
+    name: Run Controlled Tests
+    needs: check-command
+    if: needs.check-command.outputs.should_run == 'true'
+    uses: ./.github/workflows/tests.yml
+    with:
+      pr_number: ${{ needs.check-command.outputs.pr_number }}
+      notify_slack: false
+      test_tags: ${{ needs.check-command.outputs.test_tags }}
+      ref: ${{ needs.check-command.outputs.pr_sha }}
+    secrets:
+      AIVEN_TOKEN: ${{ secrets.AIVEN_TOKEN }}
+      AIVEN_ACCOUNT_ID: ${{ secrets.AIVEN_ACCOUNT_ID }}
+      AIVEN_PROJECT_NAME_PREFIX: ${{ secrets.AIVEN_PROJECT_NAME_PREFIX }}
