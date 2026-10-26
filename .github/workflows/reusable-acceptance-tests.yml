@@ -1,0 +1,210 @@
+name: Reusable Acceptance Tests
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'The git ref (branch, tag, or commit) to run tests against'
+        required: true
+        type: string
+      filter_services:
+        description: 'Optional comma-separated service names to filter tests (e.g., "kafka,pg,vpc"). Empty = all tests.'
+        required: false
+        type: string
+        default: ""
+      tags:
+        description: 'Build tags to pass to tests (e.g., "backwardcompat"). Empty = no tags.'
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AIVEN_TOKEN:
+        required: true
+      AIVEN_PROJECT_NAME_PREFIX:
+        required: true
+      AIVEN_ORGANIZATION_NAME:
+        required: true
+      AIVEN_ORGANIZATION_ID:
+        required: true
+      AIVEN_PAYMENT_METHOD_ID:
+        required: true
+      AIVEN_BILLING_GROUP_ID:
+        required: true
+
+concurrency:
+  group: acc-tests-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  setup_aiven_project_suffix:
+    runs-on: ubuntu-latest
+    outputs:
+      project_name_suffix: ${{ steps.selproj.outputs.project_name_suffix }}
+    steps:
+      - id: selproj
+        run: echo "project_name_suffix=CONTROLLED_DUMMY" >> "$GITHUB_OUTPUT"
+
+  # This job discovers all Go test packages and partitions them into two groups:
+  # 'normal' and 'slow'.
+  # The 'normal' tests are numerous and relatively fast.
+  # Isolating them prevents bottlenecks and
+  # allows us to apply different parallelism strategies to manage CI duration.
+  find_tests:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.get_matrix.outputs.matrix }}
+      has_normal_tests: ${{ steps.get_matrix.outputs.has_normal_tests }}
+      has_slow_tests: ${{ steps.get_matrix.outputs.has_slow_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: arduino/setup-task@v3
+        with:
+          version: '3.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - id: get_matrix
+        name: Discover test matrix
+        run: |
+          task ci:discover-test-matrix FILTER_SERVICES="${{ inputs.filter_services }}" | jq -cr '
+            # The input from the pipe is the correct JSON: {"slow":[...], "normal":[...]}
+            {
+              "matrix": tostring,
+              "has_normal_tests": (.normal | length > 0),
+              "has_slow_tests": (.slow | length > 0)
+            } |
+            to_entries[] | "\(.key)=\(.value)"
+          ' >> $GITHUB_OUTPUT
+
+  test-normal:
+    name: ${{ matrix.pkg.label }} (${{ matrix.pkg.type }}, normal)
+    needs: [setup_aiven_project_suffix, find_tests]
+    if: needs.find_tests.outputs.has_normal_tests == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ACC_TEST_PARALLELISM: 5
+    strategy:
+      max-parallel: 5
+      fail-fast: false
+      matrix:
+        pkg: ${{ fromJson(needs.find_tests.outputs.matrix).normal }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - id: go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: acc-go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum', '**/*.go') }}
+          restore-keys: acc-go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-
+      - uses: arduino/setup-task@v3
+        with:
+          version: '3.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+      - id: get_tf_path
+        name: Get Terraform Path
+        run: echo "terraform_path=$(which terraform)" >> $GITHUB_OUTPUT
+      - name: Run Acceptance Tests
+        run: task test-acc
+        env:
+          AIVEN_TOKEN: ${{ secrets.AIVEN_TOKEN }}
+          TF_ACC_TERRAFORM_PATH: ${{ steps.get_tf_path.outputs.terraform_path }}
+          AIVEN_PROJECT_NAME: >-
+            ${{ secrets.AIVEN_PROJECT_NAME_PREFIX }}${{ needs.setup_aiven_project_suffix.outputs.project_name_suffix }}
+          AIVEN_ORGANIZATION_NAME: ${{ secrets.AIVEN_ORGANIZATION_NAME }}
+          AIVEN_ORGANIZATION_ID: ${{ secrets.AIVEN_ORGANIZATION_ID }}
+          AIVEN_ACCOUNT_NAME: ${{ secrets.AIVEN_ORGANIZATION_NAME }}
+          AIVEN_PAYMENT_METHOD_ID: ${{ secrets.AIVEN_PAYMENT_METHOD_ID }}
+          AIVEN_BILLING_GROUP_ID: ${{ secrets.AIVEN_BILLING_GROUP_ID }}
+          PKG_PATH: ${{ matrix.pkg.path }}
+          GO_BUILD_TAGS: ${{ inputs.tags }}
+
+  test-slow:
+    name: ${{ matrix.pkg.label }} (${{ matrix.pkg.type }}, slow)
+    needs: [setup_aiven_project_suffix, find_tests]
+    if: needs.find_tests.outputs.has_slow_tests == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ACC_TEST_PARALLELISM: 3 # this amount of slow tests should <= then the number of parallel jobs
+    strategy:
+      max-parallel: 3
+      fail-fast: false
+      matrix:
+        pkg: ${{ fromJson(needs.find_tests.outputs.matrix).slow }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - id: go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: acc-go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.mod', 'go.sum', '**/*.go') }}
+          restore-keys: acc-go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-
+      - uses: arduino/setup-task@v3
+        with:
+          version: '3.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+      - id: get_tf_path
+        name: Get Terraform Path
+        run: echo "terraform_path=$(which terraform)" >> $GITHUB_OUTPUT
+      - name: Run Acceptance Tests
+        run: task test-acc
+        env:
+          AIVEN_TOKEN: ${{ secrets.AIVEN_TOKEN }}
+          TF_ACC_TERRAFORM_PATH: ${{ steps.get_tf_path.outputs.terraform_path }}
+          AIVEN_PROJECT_NAME: >-
+            ${{ secrets.AIVEN_PROJECT_NAME_PREFIX }}${{ needs.setup_aiven_project_suffix.outputs.project_name_suffix }}
+          AIVEN_ORGANIZATION_NAME: ${{ secrets.AIVEN_ORGANIZATION_NAME }}
+          AIVEN_ORGANIZATION_ID: ${{ secrets.AIVEN_ORGANIZATION_ID }}
+          AIVEN_ACCOUNT_NAME: ${{ secrets.AIVEN_ORGANIZATION_NAME }}
+          AIVEN_PAYMENT_METHOD_ID: ${{ secrets.AIVEN_PAYMENT_METHOD_ID }}
+          AIVEN_BILLING_GROUP_ID: ${{ secrets.AIVEN_BILLING_GROUP_ID }}
+          PKG_PATH: ${{ matrix.pkg.path }}
+          GO_BUILD_TAGS: ${{ inputs.tags }}
+
+  tests-summary:
+    name: All Tests Passed
+    runs-on: ubuntu-latest
+    needs: [test-normal, test-slow]
+    if: always()
+    steps:
+      - name: Check matrix outcome
+        run: |
+          if [[ "${{ needs.test-normal.result }}" == "success" && ("${{ needs.test-slow.result }}" == "success" || "${{ needs.test-slow.result }}" == "skipped") ]]; then
+            echo "All tests passed successfully!"
+          else
+            echo "One or more test jobs failed."
+            echo "Normal tests result: ${{ needs.test-normal.result }}"
+            echo "Slow tests result: ${{ needs.test-slow.result }}"
+            exit 1
+          fi
+

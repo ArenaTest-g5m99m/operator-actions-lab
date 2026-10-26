@@ -1,326 +1,283 @@
-version: "3"
+version: '3'
 
 includes:
   internal:
-    taskfile: ./Taskfile.internal.yml
+    taskfile: ./TaskInternal.yml
     internal: true
+
+vars:
+  CHANGELOG_FILE: CHANGELOG.md
+  CHANGELOG_BACKUP: CHANGELOG.md.bak
+  VERSION_PATTERN: '^[0-9]+\.[0-9]+\.[0-9]+(-.*)?$'
+
+env:
+  PROVIDER_AIVEN_ENABLE_BETA: true
 
 tasks:
   default:
-    desc: Lists available tasks defined in this file.
+    desc: Lists available tasks defined in this file
     silent: true
     cmds:
-      - task: help
+      - task --list
 
-  help:
-    desc: Lists available tasks defined in this file.
-    silent: true
-    cmds:
-      - |
-        echo "Quick Start:"
-        echo "  task doctor          # Check prerequisites"
-        echo "  task init            # Initialize development environment"
-        echo "  task build           # Build the operator"
-        echo "  task test            # Run unit tests"
-        echo ""
-        echo "All available tasks:"
-        task --list
-
-  doctor:
-    desc: 🔍 Check if all required development tools and dependencies are installed
-    silent: true
-    preconditions:
-      - sh: command -v docker || command -v podman
-        msg: |
-          🚨 Container runtime not found
-          Please install Docker or Podman:
-          - Docker: https://docs.docker.com/get-docker/
-          - Podman: https://podman.io/getting-started/installation
-      - sh: command -v helm
-        msg: |
-          🚨 Helm is not installed
-          Please visit: https://helm.sh/docs/intro/install/
-      - sh: "command -v {{.KUBECTL_BIN}}"
-        msg: |
-          🚨 kubectl is not installed
-          Please visit: https://kubernetes.io/docs/tasks/tools/install-kubectl/
-      - sh: command -v kind
-        msg: |
-          🚨 Kind is not installed
-          Please visit: https://kind.sigs.k8s.io/docs/user/quick-start/#installation
-      - sh: command -v go
-        msg: |
-          🚨 Go is not installed
-          Please visit: https://golang.org/doc/install
-      - sh: command -v git
-        msg: |
-          🚨 Git is not installed
-          Please install Git for your platform
-      - sh: command -v avn
-        msg: |
-          🚨 Aiven CLI (avn) is not installed
-          Required for E2E tests. Install: https://github.com/aiven/aiven-client#installation
-      - sh: command -v jq
-        msg: |
-          🚨 jq is not installed
-          Please visit: https://stedolan.github.io/jq/download/
-      - sh: command -v kcat
-        msg: |
-          🚨 kcat (formerly kafkacat) is not installed
-          Required for E2E tests. Visit: https://github.com/edenhill/kcat#install
-      - sh: command -v base64
-        msg: |
-          🚨 base64 command is not installed
-          This should be available on most systems
-      - sh: command -v trunk
-        msg: |
-          🚨 Trunk.io CLI is not installed
-          Optional but recommended. Visit: https://docs.trunk.io/check/cli#install
-      - sh: kubectl kuttl version > /dev/null 2>&1 || kubectl kuttl --help > /dev/null 2>&1
-        msg: |
-          🚨 KUTTL (kubectl kuttl plugin) is not installed
-          Required for E2E tests. Visit: https://kuttl.dev/docs/installation
-    cmds:
-      - cmd: echo '👍 All global prerequisites are met.'
-      - cmd: |
-          echo "⚠️  Note for macOS users: The system 'base64' does not support the '-w0' flag. 
-          If tests fail due to this, consider installing 'coreutils' (brew install coreutils) and using 'gbase64 -w0'."
-        platforms: [darwin]
-
-  init:
-    desc: Initialize the development environment (one-time setup)
-    deps: [doctor]
-    cmds:
-      - task: tools:setup
-      - task: kind:setup
-      - |
-        echo ""
-        echo "🎉 Development environment initialized successfully!"
-
-  #-------------------------------------
-  # Development
-  #-------------------------------------
-
+  #################################################
+  # Build Tasks
+  #################################################
   build:
-    desc: Build the operator manager binary
-    deps: [generate]
+    desc: Build the provider binary
+    env:
+      PROVIDER_AIVEN_ENABLE_BETA: false
+    cmds:
+      - "{{.GO_CMD}} build"
+
+  build-dev:
+    desc: Build the development version for local Terraform testing
+    cmds:
+      - mkdir -p {{.BUILD_DEV_DIR}}
+      - "{{.GO_CMD}} build -gcflags='all=-N -l' -o {{.BUILD_DEV_BIN}}"
     sources:
       - "**/*.go"
-      - go.mod
-      - go.sum
-    generates: [bin/manager]
-    cmds:
-      - "{{.GO_CMD}} build -o bin/manager ./main.go"
+    generates:
+      - "{{.BUILD_DEV_BIN}}"
 
-  generate:
-    desc: 🔧 Run all code generation
+  #################################################
+  # Test Tasks
+  #################################################
+  test:
+    desc: Run all tests (unit, acceptance, examples)
+    deps:
+      - test-unit
+      - test-acc
+      - test-examples
+
+  test-unit:
+    desc: Run unit tests
+    aliases:
+      - unit
+    env:
+      TF_ACC: 0
     cmds:
-      - defer: { task: fmt }
-      - task: internal:generate:userconfigs
-      - task: internal:generate:boilerplate
-      - task: internal:generate:manifests
-      - task: internal:generate:docs
-      - task: internal:generate:charts
+      - env -u AIVEN_TOKEN
+        {{.TESTSUM}}
+        --format pkgname
+        --hide-summary=skipped
+        --
+        -json ./...
+        -cover
+        -timeout=120s
+
+  test-acc:
+    desc: "Run acceptance tests (e.g., task test-acc -- -run TestAccResourceMyThing)"
+    env:
+      TF_ACC: 1
+    vars:
+      EFFECTIVE_PKG_PATH: '{{env "PKG_PATH" | default .PKG_PATH}}'
+      TAGS: '{{.TAGS | default (env "GO_BUILD_TAGS")}}'
+      TAGS_FLAG: '{{if .TAGS}}-tags={{.TAGS}}{{end}}'
+    cmds:
+      - cmd: "{{.GO_CMD}} test ./{{.EFFECTIVE_PKG_PATH}}/... {{.TAGS_FLAG}} -v -count {{.TEST_COUNT}} -parallel {{.ACC_TEST_PARALLELISM}} {{.CLI_ARGS}} -timeout {{.ACC_TEST_TIMEOUT}}"
+
+  test-examples:
+    desc: "Run examples tests (e.g., task test-examples -- -run TestAccExampleMyThing)"
+    deps:
+      - build-dev
+      - internal:clean-examples
+    env:
+      AIVEN_PROVIDER_PATH: "{{.BUILD_DEV_DIR}}"
+    cmds:
+      - "{{.TESTSUM}}
+        --format testname
+        --hide-summary=skipped
+        --
+        --tags=examples
+        -json ./examples_tests/...
+        -v
+        -count {{.TEST_COUNT}}
+        -parallel {{.ACC_TEST_PARALLELISM}}
+        -timeout {{.ACC_TEST_TIMEOUT}}
+        {{.CLI_ARGS}}"
+
+  test-backward:
+    desc: Run backward compatibility tests
+    cmds:
+      - task: test-acc
+        vars:
+          TAGS: backwardcompat
+
+  #################################################
+  # Code Style Tasks
+  #################################################
+  lint:
+    desc: Run all linters (Go, Tests, Docs, Semgrep)
+    deps:
+      - internal:lint-go
+      - internal:lint-test
+      - internal:lint-docs
+      - internal:semgrep
 
   fmt:
-    desc: Format code.
-    cmds:
-      - go fix ./...
-      - task: internal:fmt:fumpt
-      - task: internal:fmt:go
-      - task: internal:fmt:trunk
-      - task: internal:fmt:imports
-
-  lint:go:
-    desc: Run Go linters.
-    cmds:
-      - task: internal:lint:vet
-      - task: internal:lint:golangci-lint
-      - task: internal:lint:api-decoupled
-
-  lint:
-    desc: Run all linters.
-    cmds:
-      - task: lint:go
-      - task: internal:lint:trunk
-
-  tools:setup:
-    desc: Setup all development tools (clean install)
-    silent: true
-    cmds:
-      - task: internal:tools:clean
-      - |
-        echo "🔧 Installing all development tools..."
-      - defer: { task: internal:tools:verify }
-      - task: internal:tools:install:all
-      - |
-        echo ""
-        echo "✅ All development tools installed successfully!"
-
-  kind:setup:
-    desc: Complete Kind cluster setup with operator installation and image building
-    deps: [internal:kind:create]
-    cmds:
-      - task: k8s:cleanup
-      - task: internal:kind:setup-certmanager
-      - task: internal:kind:build-image
-      - task: internal:kind:load-image
-      - task: internal:kind:install-operator
-      - task: internal:kind:verify
-
-  kind:delete:
-    desc: 🗑️ Delete local Kind cluster
-    cmds:
-      - |
-        if kind get clusters 2>/dev/null | grep -qx {{.KIND_CLUSTER_NAME}}; then
-          echo "🗑️ Deleting Kind cluster '{{.KIND_CLUSTER_NAME}}'..."
-          kind delete cluster --name {{.KIND_CLUSTER_NAME}}
-          echo "✅ Kind cluster deleted"
-        else
-          echo "ℹ️ Kind cluster '{{.KIND_CLUSTER_NAME}}' doesn't exist"
-        fi
-
-  #-------------------------------------
-  # Tests
-  #-------------------------------------
-
-  test:
-    desc: Run tests. To target a specific test, use 'task test -- --run=TestName -otherflags'.
-    deps: [internal:tools:install:envtest]
+    desc: "Run all formatters (Go, Terraform, whitespace). Use FAST_FORMAT=true for quick formatting"
     vars:
-      K8S_ASSETS_PATH:
-        sh: '{{.ENVTEST}} use "{{.ENVTEST_K8S_VERSION}}" --bin-dir {{.LOCALBIN}} -p path'
-      TEST_TIMEOUT: '{{if ne .CLI_ARGS ""}}30m{{else}}60m{{end}}'
+      FAST_FORMAT: '{{default "false" .FAST_FORMAT}}'
     cmds:
-      - |
-        export KUBEBUILDER_ASSETS={{.K8S_ASSETS_PATH}}
-        echo "Using KUBEBUILDER_ASSETS: $KUBEBUILDER_ASSETS"
-        {{.GO_CMD}} test ./tests/... -race {{.CLI_ARGS}} -v -timeout={{.TEST_TIMEOUT}} -parallel 10 -cover -coverpkg=./controllers -covermode=atomic -coverprofile=coverage.out
+      - defer:
+          task: internal:fmt-imports
+      - task: internal:fmt-go
+      - task: internal:fmt-test
+      - task: internal:fmt-changelog
+      - task: '{{if ne .FAST_FORMAT "true"}}internal:fmt-precommit{{else}}internal:fmt-fast{{end}}'
 
-  test:unit:
-    desc: Run unit tests.
+  #################################################
+  # Utility Tasks
+  #################################################
+
+  generate:
+    desc: "Generate Go code, documentation, and mocks. Downloads openapi.json for the go-client-codegen version in go.mod; pass no_spec=true to use the local file."
+    vars:
+      no_spec: '{{.no_spec | default "false"}}'
     cmds:
-      - "{{.GO_CMD}} test ./api/... ./controllers/... ./generators/... -race {{.CLI_ARGS}} -timeout=2m"
+      - defer:
+          task: fmt
+          vars:
+            FAST_FORMAT: true
+      - task: internal:generate
+        vars:
+          no_spec: '{{.no_spec}}'
 
-  test:kuttl:
-    desc: Run end-to-end tests using kuttl.
-    #    deps: [check-env-vars, build]
+  docs:
+    desc: Generate documentation for the provider (tfplugindocs, gen-plugin, merge into docs/)
     cmds:
-      - kubectl kuttl test --config test/e2e/kuttl-test.yaml
+      - defer:
+          task: fmt
+      - task: internal:docs
 
-  test:e2e:
-    desc: Run end-to-end tests using kuttl with preinstalled operator.
-    preconditions:
-      - sh: kubectl cluster-info --context {{.KIND_KUBECTL_CONTEXT}} >/dev/null 2>&1
-        msg: Kind cluster not running. Run 'task kind:setup' first
-      - sh: '[ -n "${AIVEN_TOKEN}" ]'
-        msg: AIVEN_TOKEN environment variable must be set
-      - sh: '[ -n "${AIVEN_PROJECT_NAME}" ]'
-        msg: AIVEN_PROJECT_NAME environment variable must be set
+  update-schemas:
+    desc: "Update Go client codegen and API schemas, regenerate mocks, and update CHANGELOG.md"
     cmds:
-      - kubectl kuttl test --context {{.KIND_KUBECTL_CONTEXT}} --config test/e2e/kuttl-test.preinstalled.yaml
+      - defer:
+          task: fmt
+      - task: internal:dump-schemas
+      - task: internal:load-schemas
+      - task: internal:generate
+      - task: internal:diff-schemas
 
-  # ==============================================
-  # ☸️ Kubernetes Operations
-  # ==============================================
-
-  k8s:install:
-    desc: ☸️ Install CRDs to cluster
-    #    deps: [generate:manifests, tools:kustomize]
+  update-client:
+    desc: "Update Go client codegen"
+    aliases:
+      - client
     cmds:
-      - "{{.KUSTOMIZE}} build config/crd | kubectl apply -f -"
-
-  k8s:uninstall:
-    desc: 🗑️ Uninstall CRDs from cluster
-    #    deps: [tools:kustomize]
-    cmds:
-      - "{{.KUSTOMIZE}} build config/crd | kubectl delete --ignore-not-found=true -f -"
-
-  k8s:deploy:
-    desc: Deploy operator to cluster
-    #    deps: [generate:manifests, tools:kustomize]
-    cmds:
-      - |
-        cd config/manager && {{.KUSTOMIZE}} edit set image controller={{.IMG}}
-        cd ../..
-        {{.KUSTOMIZE}} build config/default | kubectl apply -f -
-
-  k8s:undeploy:
-    desc: Remove operator from cluster
-    deps: [tools:kustomize]
-    cmds:
-      - "{{.KUSTOMIZE}} build config/default | kubectl delete --ignore-not-found=true -f -"
-
-  k8s:cleanup:
-    desc: Cleanup resources created by e2e-setup-kind.
-    cmds:
-      - |
-        set +e # Ignore errors for cleanup
-        CLEANUP_TARGETS="aiven-operator-crds aiven-operator aiven-token cert-manager"
-        CLEANUP_NAMESPACES="cert-manager"
-        CLEANUP_SECRETS="aiven-token" # Assuming default namespace for this secret
-        for target in $CLEANUP_TARGETS; do
-          helm uninstall $target --kube-context {{.KIND_KUBECTL_CONTEXT}} || true
-        done
-        for namespace in $CLEANUP_NAMESPACES; do
-          kubectl delete namespace $namespace --context {{.KIND_KUBECTL_CONTEXT}} --ignore-not-found=true || true
-        done
-        for secret in $CLEANUP_SECRETS; do
-          kubectl delete secret $secret --context {{.KIND_KUBECTL_CONTEXT}} --ignore-not-found=true || true
-        done
-        set -e
-
-  #-------------------------------------
-  # Docs
-  #-------------------------------------
-
-  docs:serve:
-    desc: Run live preview of docs.
-    cmds:
-      - "{{.CONTAINER_TOOL}} run --rm -it -p 8000:8000 -v $(pwd)/docs:/docs zensical/zensical:latest"
-
-  docs:build:
-    desc: Builds docs website.
-    deps: [internal:generate:docs]
-    cmds:
-      - "{{.CONTAINER_TOOL}} run --rm -it -v $(pwd)/docs:/docs zensical/zensical:latest build"
-
-  #-------------------------------------
-  # Test setup and cleanup
-  #-------------------------------------
+      - task: internal:load-codegen
+      - task: internal:dump-mockery
 
   sweep:
-    desc: "Run resource sweepers to remove all resources created by e2e tests (WARNING: Destroys infrastructure!)."
+    desc: "Run resource sweepers (WARNING: Destroys infrastructure!)."
     prompt: This will destroy infrastructure. Use only in development accounts. Do you want to continue?
+    env:
+      TF_SWEEP: 1
     cmds:
-      - "{{.GO_CMD}} run ./sweeper/..."
+      - "{{.GO_CMD}} test ./internal/sweep -v -sweep={{.SWEEP}} {{.CLI_ARGS}} -timeout 15m"
 
-  find-test-tags:
-    desc: Find test tags and output as JSON matrix for GitHub Actions
+  debug:
+    desc: Run the development build in debug mode
+    deps:
+      - build-dev
+    cmds:
+      - "{{.BUILD_DEV_BIN}} -debug"
+
+  #################################################
+  # OPA Tasks
+  #################################################
+
+  opa:test:
+    desc: Run OPA policy tests
+    deps:
+      - internal:opa:verify
+    cmds:
+      - "{{.OPA}} test ./opa/policies"
+
+  opa:bundle:
+    desc: "Build OPA bundle for distribution"
+    deps:
+      - opa:test
+    vars:
+      VERSION: '{{.VERSION | default "dev"}}'
+      BUNDLE_NAME: "aiven-terraform-provider-policies"
+      OUTPUT_FILE: "./opa/dist/{{.BUNDLE_NAME}}-{{.VERSION}}.tar.gz"
+    cmds:
+      - task: opa:fmt
+      - mkdir -p opa/dist
+      - |
+        {{.OPA}} build --bundle ./opa/policies \
+        --output {{.OUTPUT_FILE}} \
+        --revision {{.VERSION}} \
+        --ignore "*_test.rego"
+
+  opa:fmt:
+    desc: "Format OPA policy files"
+    preconditions:
+      - sh: command -v {{.OPA}} >/dev/null 2>&1
+        msg: "OPA is not installed. Please run install it manually."
+    cmds:
+      - "{{.OPA}} fmt --write ./opa/policies"
+
+
+  #################################################
+  # CI Tasks
+  #################################################
+
+  ci:selproj:
+    desc: "Run selproj tool change detection"
+    cmds:
+      - "{{.SELPROJ}}"
+  ci:sweep-check:
+    desc: "Run sweeper test checks (TestCheckSweepers) without deleting resources"
+    cmds:
+      - task: internal:sweep-check
+  ci:docs:
+    desc: "Generate Terraform provider documentation (only for CI usage, does not run fmt afterwards)"
+    cmds:
+      - task: internal:docs
+
+  ci:discover-test-matrix:
+    desc: "Finds Go tests, partitions them into normal/slow (test.DefaultSlowTests unless SLOW_TESTS_CSV overrides it), and generates a JSON matrix for CI. Usage: task ci:discover-test-matrix [SLOW_TESTS_CSV=slow_test1,slow_test2]"
+    vars:
+      SLOW_TESTS_CSV: '{{.SLOW_TESTS_CSV | default ""}}'
+    cmds:
+      - task: internal:discover-test-matrix
+        vars:
+          SLOW_TESTS_CSV: '{{.SLOW_TESTS_CSV}}'
+
+  ci:changelog-update:
+    desc: Update CHANGELOG.md with new version entry
+    vars:
+      VERSION: '{{.VERSION}}'
+      DATE: '{{.DATE | default ""}}'
+    preconditions:
+      - sh: test -f "{{.CHANGELOG_FILE}}"
+        msg: "{{.CHANGELOG_FILE}} not found"
+      - sh: test -n "{{.VERSION}}"
+        msg: "VERSION is required"
+    cmds:
+      - "{{.GO_CMD}} run ./tools changelog update {{.VERSION}} --date '{{.DATE}}'"
+
+  ci:changelog-extract:
+    desc: Extract changelog content for a specific version
     silent: true
     vars:
-      TAGS: '{{.TAGS | default ""}}'
+      VERSION: '{{.VERSION | default "0.0.0"}}'
+    preconditions:
+      - sh: test -f "{{.CHANGELOG_FILE}}"
+        msg: "{{.CHANGELOG_FILE}} not found"
+      - sh: test -n "{{.VERSION}}"
+        msg: "VERSION is required"
     cmds:
-      - |
-        # find all available test tags
-        all_tags=$(
-          grep -r '^//go:build' tests/ \
-            | cut -d' ' -f2- \
-            | tr ' ' '\n' \
-            | grep -v '!' \
-            | grep -v 'suite' \
-            | sort -u
-        )
+      - "{{.GO_CMD}} run ./tools/main.go changelog extract {{.VERSION}}"
 
-        # filter to requested tags if provided, otherwise use all, ignores invalid ones
-        if [ -n "{{.TAGS}}" ]; then
-          tags=$(
-            for tag in {{.TAGS}}; do
-              echo "$all_tags" | grep -x "$tag" || true
-            done | jq -cnR '[inputs | select(length>0)]'
-          )
-        else
-          tags=$(echo "$all_tags" | jq -cnR '[inputs | select(length>0)]')
-        fi
-
-        echo "matrix=$tags"
+  ci:verify-version:
+    desc: "Verifies the new version doesn't exist and is a sequential bump. Usage: task ci:verify-version VERSION=x.y.z"
+    cmds:
+      - task: internal:verify-version
+        vars:
+          VERSION: '{{.VERSION}}'
+    requires:
+      vars: [VERSION]
